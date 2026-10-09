@@ -1,0 +1,274 @@
+<#
+.SYNOPSIS
+    Active Directory Bilgisayar Taşıma ve E-posta Raporlama Betiği.
+
+.DESCRIPTION
+    Varsayılan CN=Computers konteyneri altındaki bilgisayarları belirlenen isimlendirme 
+    kurallarına göre ilgili Organizational Unit (OU) altına taşır ve işlem sonucunu 
+    HTML formatında e-posta ile raporlar.
+
+.NOTES
+    Gereksinimler: ActiveDirectory PowerShell Modülü
+#>
+
+# =========================
+# SMTP AYARLARI
+# =========================
+$smtpServer     = "smtp.yourdomain.com"                  # SMTP Sunucu Adı veya IP
+$smtpPort       = 25                                     # SMTP Portu (varsayılan: 25)
+$smtpFrom       = "noreply-adreports@yourdomain.com"     # Gönderen E-posta Adresi
+$smtpCredential = $null                                  # Gerekirse: Get-Credential veya PSCredential nesnesi
+
+# =========================
+# RAPOR VE LOG AYARLARI
+# =========================
+$reportMailTo   = "admin@yourdomain.com"                 # Raporun Gönderileceği E-posta
+$reportFolder   = "C:\Scripts\Reports\ComputerMove"      # Raporların Kaydedileceği Klasör
+$LogPath        = "C:\Scripts\Logs\ComputerMove_$(Get-Date -Format 'yyyyMMdd').log"
+
+# Klasör Kontrolleri
+if (-not (Test-Path -Path $reportFolder)) {
+    New-Item -Path $reportFolder -ItemType Directory -Force | Out-Null
+}
+
+$LogDir = Split-Path $LogPath
+if (-not (Test-Path -Path $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
+
+$reportFile = Join-Path -Path $reportFolder -ChildPath "ComputerMove_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+
+function Write-Log {
+    param([string]$Message)
+    $TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$TimeStamp - $Message" | Out-File -FilePath $LogPath -Append -Encoding UTF8
+    Write-Output "$TimeStamp - $Message"
+}
+
+# =========================
+# AD VE KURAL TANIMLARI
+# =========================
+$DomainDN = (Get-ADDomain).DistinguishedName
+$DefaultComputersContainer = "CN=Computers,$DomainDN"
+
+# Taşıma Kuralları (Kendi ortamınıza göre düzenleyebilirsiniz)
+$Rules = @(
+    @{ Prefix = "IST-PC-*"; TargetOU = "OU=Istanbul,OU=Workstations,$DomainDN" },
+    @{ Prefix = "ANK-PC-*"; TargetOU = "OU=Ankara,OU=Workstations,$DomainDN" },
+    @{ Prefix = "SRV-*";    TargetOU = "OU=Servers,$DomainDN" }
+)
+
+Write-Log "=== Bilgisayar Taşıma İşlemi Başladı ==="
+
+$Computers = Get-ADComputer -SearchBase $DefaultComputersContainer -SearchScope OneLevel -Filter *
+
+# Rapor verilerini tutacak liste
+$ReportList = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+if ($null -eq $Computers -or $Computers.Count -eq 0) {
+    Write-Log "CN=Computers altında taşınacak bilgisayar bulunamadı."
+} else {
+    Write-Log "CN=Computers altında $($Computers.Count) adet bilgisayar tespit edildi."
+
+    foreach ($comp in $Computers) {
+        $matched = $false
+
+        foreach ($rule in $Rules) {
+            if ($comp.Name -like $rule.Prefix) {
+                $matched = $true
+                try {
+                    if (Get-ADOrganizationalUnit -Identity $rule.TargetOU -ErrorAction Stop) {
+                        Move-ADObject -Identity $comp.DistinguishedName -TargetPath $rule.TargetOU -ErrorAction Stop
+                        Write-Log "[BAŞARILI] $($comp.Name) -> $($rule.TargetOU) hedefine taşındı."
+
+                        $ReportList.Add([PSCustomObject]@{
+                            ComputerName = $comp.Name
+                            TargetOU     = $rule.TargetOU
+                            Status       = "Başarılı"
+                            Message      = "Hedef OU'ya başarıyla taşındı."
+                        })
+                    }
+                }
+                catch {
+                    $errMsg = $_.Exception.Message
+                    Write-Log "[HATA] $($comp.Name) taşınırken hata oluştu: $errMsg"
+
+                    $ReportList.Add([PSCustomObject]@{
+                        ComputerName = $comp.Name
+                        TargetOU     = $rule.TargetOU
+                        Status       = "Hata"
+                        Message      = $errMsg
+                    })
+                }
+                break
+            }
+        }
+
+        if (-not $matched) {
+            Write-Log "[ATLANDI] $($comp.Name) tanımlı kurallarla eşleşmedi, CN=Computers altında bırakıldı."
+
+            $ReportList.Add([PSCustomObject]@{
+                ComputerName = $comp.Name
+                TargetOU     = "—"
+                Status       = "Atlandı"
+                Message      = "Kurallarla eşleşmedi."
+            })
+        }
+    }
+}
+
+Write-Log "=== Bilgisayar Taşıma İşlemi Tamamlandı ==="
+
+# ========================================================
+# İSTATİSTİKLER VE HTML BODY OLUŞTURMA
+# ========================================================
+$TotalDetected = if ($Computers) { $Computers.Count } else { 0 }
+$SuccessCount  = @($ReportList | Where-Object { $_.Status -eq "Başarılı" }).Count
+$FailedCount   = @($ReportList | Where-Object { $_.Status -eq "Hata" }).Count
+$SkippedCount  = @($ReportList | Where-Object { $_.Status -eq "Atlandı" }).Count
+
+# Tablo satırlarını oluştur
+$TableRows = ""
+foreach ($item in $ReportList) {
+    # Outlook uyumlu satır içi badge renkleri
+    $badgeStyle = switch ($item.Status) {
+        "Başarılı" { "background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb;" }
+        "Hata"     { "background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb;" }
+        "Atlandı"  { "background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba;" }
+        default    { "background-color: #e2e3e5; color: #383d41; border: 1px solid #d6d8db;" }
+    }
+
+    $TableRows += @"
+    <tr style="border-bottom: 1px solid #e9ecef;">
+        <td style="padding: 10px 12px; font-weight: 600; color: #212529;">$($item.ComputerName)</td>
+        <td style="padding: 10px 12px; color: #495057; font-size: 13px;">$($item.TargetOU)</td>
+        <td style="padding: 10px 12px; text-align: center;">
+            <span style="display: inline-block; padding: 3px 8px; font-size: 12px; font-weight: bold; border-radius: 4px; $badgeStyle">
+                $($item.Status)
+            </span>
+        </td>
+        <td style="padding: 10px 12px; color: #6c757d; font-size: 13px;">$($item.Message)</td>
+    </tr>
+"@
+}
+
+# HTML Rapor Şablonu
+$reportBody = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Active Directory Bilgisayar Taşıma Raporu</title>
+</head>
+<body style="margin: 0; padding: 20px; background-color: #f4f6f9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+    <table align="center" border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 800px; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.08); overflow: hidden;">
+        <!-- Başlık -->
+        <tr>
+            <td style="background-color: #1e3a8a; padding: 24px; color: #ffffff;">
+                <h2 style="margin: 0; font-size: 20px; font-weight: 600;">Active Directory Bilgisayar Taşıma Raporu</h2>
+                <p style="margin: 6px 0 0; font-size: 13px; color: #bfdbfe;">Çalışma Tarihi: $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss')</p>
+            </td>
+        </tr>
+        
+        <!-- İstatistik Kartları -->
+        <tr>
+            <td style="padding: 20px 24px 10px;">
+                <table width="100%" cellspacing="0" cellpadding="0" border="0">
+                    <tr>
+                        <td width="23%" style="background-color: #f8fafc; border-left: 4px solid #3b82f6; padding: 12px; border-radius: 4px;">
+                            <div style="font-size: 12px; color: #64748b; font-weight: 600;">TOPLAM</div>
+                            <div style="font-size: 20px; font-weight: bold; color: #1e293b; margin-top: 4px;">$TotalDetected</div>
+                        </td>
+                        <td width="2%">&nbsp;</td>
+                        <td width="23%" style="background-color: #f0fdf4; border-left: 4px solid #22c55e; padding: 12px; border-radius: 4px;">
+                            <div style="font-size: 12px; color: #166534; font-weight: 600;">BAŞARILI</div>
+                            <div style="font-size: 20px; font-weight: bold; color: #15803d; margin-top: 4px;">$SuccessCount</div>
+                        </td>
+                        <td width="2%">&nbsp;</td>
+                        <td width="23%" style="background-color: #fef2f2; border-left: 4px solid #ef4444; padding: 12px; border-radius: 4px;">
+                            <div style="font-size: 12px; color: #991b1b; font-weight: 600;">HATA</div>
+                            <div style="font-size: 20px; font-weight: bold; color: #b91c1c; margin-top: 4px;">$FailedCount</div>
+                        </td>
+                        <td width="2%">&nbsp;</td>
+                        <td width="23%" style="background-color: #fffbeb; border-left: 4px solid #f59e0b; padding: 12px; border-radius: 4px;">
+                            <div style="font-size: 12px; color: #92400e; font-weight: 600;">ATLANDI</div>
+                            <div style="font-size: 20px; font-weight: bold; color: #b45309; margin-top: 4px;">$SkippedCount</div>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+
+        <!-- Detay Tablosu -->
+        <tr>
+            <td style="padding: 15px 24px 24px;">
+                <h3 style="margin: 0 0 12px; font-size: 15px; color: #334155;">İşlem Detayları</h3>
+                <table width="100%" cellspacing="0" cellpadding="0" style="border-collapse: collapse; text-align: left; font-size: 13px;">
+                    <thead>
+                        <tr style="background-color: #f1f5f9; border-bottom: 2px solid #cbd5e1;">
+                            <th style="padding: 10px 12px; color: #475569;">Bilgisayar Adı</th>
+                            <th style="padding: 10px 12px; color: #475569;">Hedef OU</th>
+                            <th style="padding: 10px 12px; color: #475569; text-align: center;">Durum</th>
+                            <th style="padding: 10px 12px; color: #475569;">Açıklama</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        $(if ($TableRows) { $TableRows } else { '<tr><td colspan="4" style="padding: 16px; text-align: center; color: #94a3b8;">İşlem yapılacak bilgisayar bulunamadı.</td></tr>' })
+                    </tbody>
+                </table>
+            </td>
+        </tr>
+
+        <!-- Alt Bilgi (Footer) -->
+        <tr>
+            <td style="background-color: #f8fafc; padding: 12px 24px; border-top: 1px solid #e2e8f0; font-size: 12px; color: #94a3b8; text-align: center;">
+                Bu rapor otomatik olarak Active Directory taşıma görevi tarafından üretilmiştir.
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
+"@
+
+# Raporu diske HTML olarak kaydet
+$reportBody | Out-File -FilePath $reportFile -Encoding UTF8
+
+# =========================
+# SMTP CLIENT VE GÖNDERİM
+# =========================
+$smtpClient = New-Object System.Net.Mail.SmtpClient($smtpServer, $smtpPort)
+if ($null -ne $smtpCredential) {
+    $smtpClient.Credentials = $smtpCredential
+}
+
+$reportMailMessage = $null
+try {
+    $reportMailMessage = New-Object System.Net.Mail.MailMessage
+    $reportMailMessage.From = $smtpFrom
+    $reportMailMessage.To.Add($reportMailTo)
+    $reportMailMessage.Subject = "AD Bilgisayar Taşıma Raporu - $(Get-Date -Format 'dd.MM.yyyy HH:mm')"
+    $reportMailMessage.SubjectEncoding = [System.Text.Encoding]::UTF8
+    $reportMailMessage.Body = $reportBody
+    $reportMailMessage.BodyEncoding = [System.Text.Encoding]::UTF8
+    $reportMailMessage.IsBodyHtml = $true
+
+    # HTML dosyasını ek olarak iliştir
+    if (Test-Path -Path $reportFile) {
+        $attachment = New-Object System.Net.Mail.Attachment($reportFile)
+        $reportMailMessage.Attachments.Add($attachment)
+    }
+
+    $smtpClient.Send($reportMailMessage)
+    Write-Host ("Rapor maili başarıyla gönderildi: {0}" -f $reportMailTo) -ForegroundColor Green
+}
+catch {
+    Write-Warning ("Rapor maili gönderilemedi: {0}" -f $_.Exception.Message)
+}
+finally {
+    if ($null -ne $reportMailMessage) {
+        $reportMailMessage.Dispose()
+    }
+    if ($null -ne $smtpClient) {
+        $smtpClient.Dispose()
+    }
+}
