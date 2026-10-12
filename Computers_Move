@@ -26,6 +26,9 @@ $reportMailTo   = "admin@yourdomain.com"                 # Raporun Gönderilece�
 $reportFolder   = "C:\Scripts\Reports\ComputerMove"      # Raporların Kaydedileceği Klasör
 $LogPath        = "C:\Scripts\Logs\ComputerMove_$(Get-Date -Format 'yyyyMMdd').log"
 
+# Bilgisayar bulunamadığında mail gönderilsin mi? ($true = Evet gönder, $false = Gönderme)
+$SendEmailIfNoComputersFound =$false
+
 # Klasör Kontrolleri
 if (-not (Test-Path -Path $reportFolder)) {
     New-Item -Path $reportFolder -ItemType Directory -Force | Out-Null
@@ -236,11 +239,14 @@ $reportBody | Out-File -FilePath $reportFile -Encoding UTF8
 # =========================
 # SMTP CLIENT VE GÖNDERİM
 # =========================
-$smtpClient = New-Object System.Net.Mail.SmtpClient($smtpServer, $smtpPort)
-if ($null -ne $smtpCredential) {
-    $smtpClient.Credentials = $smtpCredential
+if ($TotalDetected -eq 0 -and -not$SendEmailIfNoComputersFound) {
+    Write-Log "[BİLGİ] Taşınacak/tespit edilen bilgisayar bulunmadığından ve `$SendEmailIfNoComputersFound = `$false olduğundan mail gönderimi atlandı."
 }
-
+else {
+    $smtpClient = New-Object System.Net.Mail.SmtpClient($smtpServer,$smtpPort)
+    if ($null -ne$smtpCredential) {
+        $smtpClient.Credentials =$smtpCredential
+    }
 $reportMailMessage = $null
 try {
     $reportMailMessage = New-Object System.Net.Mail.MailMessage
